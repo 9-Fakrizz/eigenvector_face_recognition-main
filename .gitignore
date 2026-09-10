@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+env/
+venv/
+.venv/
+.venv*/
+*/env/
+
+# Face database (contains biometric data captured at enrollment time —
+# generated locally by main.py, not something to commit)
+vector_face_recognition/encodings.pkl
+vector_face_recognition/faces_db.npz
+vector_face_recognition/registry.json
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
