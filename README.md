@@ -54,7 +54,16 @@ which ships a prebuilt `dlib` binary:
 ```bash
 # Install Miniconda first: https://docs.conda.io/en/latest/miniconda.html
 conda create -n faceid --override-channels -c conda-forge python=3.10
-conda install -n faceid --override-channels -c conda-forge opencv numpy pillow pyserial dlib face_recognition
+
+# Pin the CPU build of dlib explicitly. Without this, conda-forge's solver
+# can pick a CUDA build instead and pull in ~1GB of NVIDIA cuDNN packages
+# you don't need for this app (and probably don't have the download budget
+# for). "cpu_py310*" matches your Python version above.
+conda install -n faceid --override-channels -c conda-forge "dlib=20.0.1=cpu_py310*" opencv numpy pillow pyserial face_recognition
+
+# face_recognition's model-data package still imports the old `pkg_resources`
+# API, which recent setuptools versions no longer ship. Pin an older one:
+conda run -n faceid pip install "setuptools<81"
 ```
 
 Then run the app using that environment's Python (see below).
