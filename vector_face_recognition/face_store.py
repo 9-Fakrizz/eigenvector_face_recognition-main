@@ -35,7 +35,15 @@ from typing import Optional
 
 import numpy as np
 
-DEFAULT_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "encodings.pkl")
+DEFAULT_DB_PATH = os.environ.get(
+    "FACE_DB_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "encodings.pkl"),
+)
+# Overridable so a Docker deployment can point this at a mounted volume,
+# e.g. -v ./data:/data -e FACE_DB_PATH=/data/encodings.pkl — bind-mounting a
+# single file that doesn't exist yet on the host creates a phantom
+# directory in Docker, but mounting a directory (which always exists) and
+# pointing this at a file inside it does not have that problem.
 
 
 @dataclass

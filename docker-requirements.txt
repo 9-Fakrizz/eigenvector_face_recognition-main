@@ -1,0 +1,10 @@
+# Dependencies for the Docker image, installed after dlib (see Dockerfile).
+# opencv-python-headless instead of opencv-contrib-python: this app never
+# uses cv2.imshow/waitKey, so the headless build (which has aarch64 wheels)
+# is a better fit than building/pulling the full GUI-enabled OpenCV.
+opencv-python-headless>=4.8
+numpy>=1.24
+Pillow>=10.0
+pyserial>=3.5
+face_recognition>=1.3.0
+setuptools<81

@@ -43,6 +43,7 @@ Architecture
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import sys
 import threading
@@ -64,6 +65,7 @@ except ImportError:
 
 try:
     import serial
+    import serial.tools.list_ports
 except ImportError:
     serial = None  # serial support becomes optional / test-mode only
 
@@ -71,11 +73,17 @@ from face_store import FaceStore
 
 # ============================================================
 # CONFIG
+# Everything here can be overridden by an environment variable of the same
+# name without editing this file — e.g. for a Docker deployment where the
+# ESP32 might show up as /dev/ttyUSB0 or /dev/ttyACM0 depending on the
+# board, or where a kiosk deployment wants full-screen but a dev machine
+# doesn't. The serial port can also be changed at runtime from the
+# Recognize page (SERIAL PORT box) without restarting the app.
 # ============================================================
-SERIAL_PORT     = "/dev/ttyUSB0"   # e.g. "COM3" on Windows
-SERIAL_BAUD     = 115200
-CAMERA_INDEX    = 0
-FACE_TOLERANCE  = 0.50             # lower = stricter match
+SERIAL_PORT     = os.environ.get("SERIAL_PORT", "/dev/ttyUSB0")   # e.g. "COM3" on Windows
+SERIAL_BAUD     = int(os.environ.get("SERIAL_BAUD", "115200"))
+CAMERA_INDEX    = int(os.environ.get("CAMERA_INDEX", "0"))
+FACE_TOLERANCE  = float(os.environ.get("FACE_TOLERANCE", "0.50"))  # lower = stricter match
 SCAN_FRAMES     = 12               # max frames captured per scan attempt
 MIN_VOTE_FRAMES = 4                # don't decide before at least this many votes
 EARLY_EXIT_MARGIN = 3              # stop early once leader beats runner-up by this much
@@ -83,6 +91,11 @@ UNKNOWN_ID      = "000000000"      # sent back when no face matched
 MAX_WORKERS     = 1                # recognition jobs are serialized: one camera, GIL-bound work
 DETECTION_DOWNSCALE = 0.35         # detect on a smaller frame, encode on full-res crop
 RESULT_HOLD_MS  = 3000             # how long a result stays on screen before returning to idle
+CAPTURE_INTERVAL = 0.25            # min seconds between accepted samples during registration
+START_FULLSCREEN = os.environ.get("START_FULLSCREEN", "0") == "1"
+                                    # "1" for a kiosk/door deployment (set this in Docker);
+                                    # default keeps a normal window so a dev console stays
+                                    # visible. Press F11 anytime to go full-screen, Esc to leave.
 
 GUIDED_STEPS = [
     ("Straight",  "Look STRAIGHT at the camera", 6),
@@ -191,31 +204,58 @@ class SerialLink:
     Wraps ESP32 serial I/O. If the port can't be opened, runs in
     "test mode": read/write become no-ops but the rest of the app
     (including the manual TEST SCAN button) still works normally.
+
+    Supports switching to a different port at runtime via reconnect() —
+    e.g. the ESP32 enumerates as /dev/ttyACM0 instead of /dev/ttyUSB0 on
+    this particular board/cable, or as a different COM port on Windows.
+    Each (re)connect bumps a generation counter; reader/writer threads
+    from a superseded connection notice the mismatch and exit instead of
+    fighting over self.ser with the new connection's threads.
     """
 
     def __init__(self, port: str, baud: int, trigger_queue: "queue.Queue[str]"):
+        self.baud = baud
         self.trigger_queue = trigger_queue
         self.write_queue: "queue.Queue[str]" = queue.Queue()
         self.ser = None
+        self.port = port
         self.connected = False
         self._tx_count = 0
+        self._lock = threading.Lock()
+        self._generation = 0
+        self.reconnect(port)
 
-        if serial is None:
-            log_serial.warning("pyserial not installed — running in TEST MODE (no hardware I/O)")
-            return
+    def reconnect(self, port: str):
+        """(Re)open the serial port, tearing down any previous connection."""
+        with self._lock:
+            self.port = port
+            if self.ser is not None:
+                try:
+                    self.ser.close()
+                except Exception:
+                    pass
+                self.ser = None
+            self.connected = False
+            self._generation += 1
+            my_generation = self._generation
 
-        try:
-            self.ser = serial.Serial(port, baud, timeout=0)
-            self.connected = True
-            log_serial.info(f"Serial open: {port} @ {baud} baud")
-        except serial.SerialException as e:
-            log_serial.warning(f"Serial error: {e} — running in TEST MODE (no hardware I/O)")
+            if serial is None:
+                log_serial.warning("pyserial not installed — running in TEST MODE (no hardware I/O)")
+                return
+
+            try:
+                self.ser = serial.Serial(port, self.baud, timeout=0)
+                self.connected = True
+                log_serial.info(f"Serial open: {port} @ {self.baud} baud")
+            except serial.SerialException as e:
+                log_serial.warning(f"Serial error opening {port}: {e} — running in TEST MODE")
+                return
+
+        threading.Thread(target=self._reader_loop, args=(my_generation,), daemon=True).start()
+        threading.Thread(target=self._writer_loop, args=(my_generation,), daemon=True).start()
 
     def start(self):
-        if not self.connected:
-            return
-        threading.Thread(target=self._reader_loop, daemon=True).start()
-        threading.Thread(target=self._writer_loop, daemon=True).start()
+        pass  # connection is established eagerly in __init__/reconnect()
 
     def send(self, msg: str):
         self._tx_count += 1
@@ -224,13 +264,20 @@ class SerialLink:
         else:
             log_serial.debug(f"[TEST MODE] would send: '{msg}' (msg #{self._tx_count})")
 
-    def _reader_loop(self):
-        log_serial.info("SerialReader thread started")
+    def _is_current(self, generation: int) -> bool:
+        with self._lock:
+            return generation == self._generation and self.ser is not None
+
+    def _reader_loop(self, generation: int):
+        log_serial.info(f"SerialReader thread started ({self.port})")
         buf = ""
-        while True:
+        while self._is_current(generation):
             try:
-                if self.ser.in_waiting:
-                    chunk = self.ser.read(self.ser.in_waiting).decode("utf-8", errors="ignore")
+                ser = self.ser
+                if ser is None:
+                    return
+                if ser.in_waiting:
+                    chunk = ser.read(ser.in_waiting).decode("utf-8", errors="ignore")
                     buf += chunk
                     while "\n" in buf:
                         line, buf = buf.split("\n", 1)
@@ -241,14 +288,21 @@ class SerialLink:
                 else:
                     time.sleep(0.01)
             except Exception as e:
+                if not self._is_current(generation):
+                    return
                 log_serial.error(f"Reader error: {e}")
                 time.sleep(0.5)
 
-    def _writer_loop(self):
-        log_serial.info("SerialWriter thread started")
-        while True:
+    def _writer_loop(self, generation: int):
+        log_serial.info(f"SerialWriter thread started ({self.port})")
+        while self._is_current(generation):
             try:
-                msg = self.write_queue.get()
+                msg = self.write_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if not self._is_current(generation):
+                return
+            try:
                 self.ser.write((msg + "\n").encode())
                 log_serial.info(f"Sent: '{msg}'")
             except Exception as e:
@@ -340,6 +394,28 @@ GOOD = "#4dff91"
 BAD = "#ff4444"
 WARN = "#ff9f1c"
 FONT_MONO = "Courier New"
+PANEL_BG_RGB = (26, 26, 26)  # matches PANEL_BG, used to pad letterboxed video
+
+
+def fit_frame(rgb: np.ndarray, target_w: int, target_h: int, pad_rgb=PANEL_BG_RGB) -> np.ndarray:
+    """
+    Scale an RGB frame to fit inside (target_w, target_h) while preserving
+    its aspect ratio, centered on a padded canvas. A naive resize straight
+    to the panel's width/height stretches a 4:3 camera frame to whatever
+    arbitrary aspect ratio the panel happens to be, which is what made the
+    Recognize page look stretched.
+    """
+    h, w = rgb.shape[:2]
+    if target_w <= 0 or target_h <= 0 or w == 0 or h == 0:
+        return rgb
+    scale = min(target_w / w, target_h / h)
+    new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
+    resized = cv2.resize(rgb, (new_w, new_h))
+    canvas = np.full((target_h, target_w, 3), pad_rgb, dtype=np.uint8)
+    x_off = (target_w - new_w) // 2
+    y_off = (target_h - new_h) // 2
+    canvas[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+    return canvas
 
 
 class NavBar(tk.Frame):
@@ -350,7 +426,7 @@ class NavBar(tk.Frame):
         tk.Label(self, text=" FACE ID SYSTEM", font=(FONT_MONO, 18, "bold"),
                  fg=FG_TEXT, bg=BG).pack(side="left", padx=(4, 24), pady=14)
 
-        for key, label in (("recognize", "RECOGNIZE"), ("register", "REGISTER"), ("manage", "MANAGE")):
+        for key, label in (("recognize", "RECOGNIZE"), ("register", "REGISTER"), ("manage", "MANAGE"), ("help", "HELP")):
             b = tk.Button(self, text=label, font=(FONT_MONO, 12, "bold"),
                           fg=FG_TEXT, bg="#222222", activebackground=ACCENT,
                           bd=0, padx=18, pady=10, cursor="hand2",
@@ -386,8 +462,17 @@ class RecognizePage(tk.Frame):
         super().__init__(parent, bg=BG)
         self.app = app
         self._state = "idle"
+        self._visible = False
         self._build()
-        self._update_camera()
+        # _poll_results is cheap (just draining a queue) so it runs
+        # continuously regardless of which page is showing — that's how a
+        # real recognition result still reaches the ESP32 promptly even if
+        # you're on the Register page. _update_camera is NOT cheap (frame
+        # grab + color convert + resize + redraw, ~30x/sec) and used to run
+        # unconditionally too, which meant it kept competing for CPU with
+        # the Register wizard's actual detection/encoding work even while
+        # this page wasn't visible. It now only runs while shown — see
+        # on_show/on_hide below.
         self._poll_results()
 
     def _build(self):
@@ -396,6 +481,12 @@ class RecognizePage(tk.Frame):
 
         cam_frame = tk.Frame(main, bg=PANEL_BG, highlightbackground="#333", highlightthickness=2)
         cam_frame.pack(side="left", fill="both", expand=True)
+        # Lock this frame's geometry to whatever the pack layout gives it,
+        # instead of letting it resize to fit its child. Without this, the
+        # video Label's displayed size feeds back into its own reported
+        # size (used to decide the *next* frame's target size), and the
+        # feed slowly drifts/stretches over time instead of staying put.
+        cam_frame.pack_propagate(False)
         self.camera_label = tk.Label(cam_frame, bg=PANEL_BG)
         self.camera_label.pack(fill="both", expand=True)
 
@@ -431,29 +522,104 @@ class RecognizePage(tk.Frame):
         self.db_label = tk.Label(side, text="—", font=(FONT_MONO, 13), fg=FG_DIM, bg=BG)
         self.db_label.pack(anchor="w", pady=(4, 16))
 
-        serial_state = "LIVE" if self.app.serial_link.connected else "TEST MODE"
-        serial_color = GOOD if self.app.serial_link.connected else WARN
         tk.Label(side, text="SERIAL", font=(FONT_MONO, 11), fg=FG_LABEL, bg=BG).pack(anchor="w")
-        tk.Label(side, text=serial_state, font=(FONT_MONO, 13, "bold"), fg=serial_color, bg=BG).pack(anchor="w", pady=(4, 20))
+        self.serial_status_label = tk.Label(side, text="", font=(FONT_MONO, 13, "bold"), bg=BG)
+        self.serial_status_label.pack(anchor="w", pady=(4, 8))
+
+        port_row = tk.Frame(side, bg=BG)
+        port_row.pack(fill="x", pady=(0, 4))
+        self.port_var = tk.StringVar(value=self.app.serial_link.port)
+        self.port_combo = ttk.Combobox(port_row, textvariable=self.port_var, font=(FONT_MONO, 11))
+        self.port_combo.pack(side="left", fill="x", expand=True)
+        tk.Button(port_row, text="↻", font=(FONT_MONO, 12, "bold"), fg=FG_TEXT, bg="#333",
+                  bd=0, padx=8, cursor="hand2", command=self._scan_ports).pack(side="left", padx=(6, 0))
+
+        tk.Button(side, text="RECONNECT", font=(FONT_MONO, 11, "bold"), fg=FG_TEXT, bg="#333",
+                  bd=0, pady=8, cursor="hand2", command=self._reconnect_serial).pack(fill="x", pady=(4, 20))
+
+        self._scan_ports()
+        self._refresh_serial_status()
 
         tk.Button(side, text="TEST SCAN", font=(FONT_MONO, 13, "bold"),
                   fg="#0d0d0d", bg=ACCENT, bd=0, pady=12, cursor="hand2",
                   command=self._manual_trigger).pack(fill="x", pady=(10, 0))
 
+        tk.Label(side, text="MANUAL SEND TO ESP32", font=(FONT_MONO, 11), fg=FG_LABEL, bg=BG).pack(anchor="w", pady=(24, 4))
+        manual_row = tk.Frame(side, bg=BG)
+        manual_row.pack(fill="x")
+        self.manual_id_var = tk.StringVar(value=UNKNOWN_ID)
+        tk.Entry(manual_row, textvariable=self.manual_id_var, font=(FONT_MONO, 13), bg="#222", fg=FG_TEXT,
+                 insertbackground=FG_TEXT, bd=0, justify="center").pack(side="left", fill="x", expand=True, ipady=6)
+        tk.Button(manual_row, text="SEND", font=(FONT_MONO, 12, "bold"),
+                  fg="#0d0d0d", bg=WARN, bd=0, padx=14, cursor="hand2",
+                  command=self._manual_send).pack(side="left", padx=(8, 0))
+        tk.Label(side, text="Bypasses the camera — writes this ID straight to the\nESP32 over serial, to test its LED/relay reaction.",
+                 font=(FONT_MONO, 9), fg=FG_DIM, bg=BG, justify="left").pack(anchor="w", pady=(4, 0))
+
     def _manual_trigger(self):
         self.app.trigger_queue.put("TRIGGER")
         log_ui.info("Manual TEST SCAN triggered")
 
+    def _manual_send(self):
+        value = self.manual_id_var.get().strip()
+        if not (value.isdigit() and len(value) == 9):
+            messagebox.showerror("Invalid ID", "ID must be exactly 9 digits (use 000000000 for 'unknown').")
+            return
+        self.app.serial_link.send(value)
+        log_ui.info(f"Manual ESP32 send: '{value}'")
+
+    def _scan_ports(self):
+        """Populate the port dropdown with currently-detected serial ports."""
+        ports: list[str] = []
+        if serial is not None:
+            try:
+                ports = [p.device for p in serial.tools.list_ports.comports()]
+            except Exception as e:
+                log_ui.warning(f"Could not list serial ports: {e}")
+        current = self.port_var.get()
+        options = ports if current in ports or not ports else [current] + ports
+        self.port_combo["values"] = options or [current]
+        log_ui.info(f"Detected serial ports: {ports or '(none)'}")
+
+    def _reconnect_serial(self):
+        port = self.port_var.get().strip()
+        if not port:
+            messagebox.showerror("Invalid port", "Enter a serial port, e.g. /dev/ttyUSB0, /dev/ttyACM0, or COM3.")
+            return
+        log_ui.info(f"Reconnecting serial to '{port}'")
+        self.app.serial_link.reconnect(port)
+        self._refresh_serial_status()
+
+    def _refresh_serial_status(self):
+        connected = self.app.serial_link.connected
+        self.serial_status_label.config(
+            text=f"{'LIVE' if connected else 'TEST MODE'}  ({self.app.serial_link.port})",
+            fg=GOOD if connected else WARN,
+        )
+
     def on_show(self):
         self.db_label.config(text=f"{len(self.app.store)} people / {self.app.store.sample_count()} samples")
+        self._refresh_serial_status()
+        if not self._visible:
+            self._visible = True
+            self._update_camera()
+
+    def on_hide(self):
+        self._visible = False
 
     def _update_camera(self):
+        if not self._visible:
+            return
         frame = self.app.camera.get_frame()
         if frame is not None:
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            w = self.camera_label.winfo_width() or 640
-            h = self.camera_label.winfo_height() or 480
-            rgb = cv2.resize(rgb, (w, h))
+            w = self.camera_label.winfo_width()
+            h = self.camera_label.winfo_height()
+            # Before the window finishes mapping, Tkinter reports a bogus
+            # 1x1 size here rather than 0 — `or` fallbacks don't catch that.
+            if w <= 1 or h <= 1:
+                w, h = 640, 480
+            rgb = fit_frame(rgb, w, h)
             img = ImageTk.PhotoImage(Image.fromarray(rgb))
             self.camera_label.configure(image=img)
             self.camera_label.image = img
@@ -514,6 +680,7 @@ class RegisterPage(tk.Frame):
         super().__init__(parent, bg=BG)
         self.app = app
         self._wizard_active = False
+        self._visible = False
         self._build()
 
     def _build(self):
@@ -522,6 +689,7 @@ class RegisterPage(tk.Frame):
 
         cam_frame = tk.Frame(main, bg=PANEL_BG, highlightbackground="#333", highlightthickness=2)
         cam_frame.pack(side="left", fill="both", expand=True)
+        cam_frame.pack_propagate(False)  # see RecognizePage._build for why
         self.canvas = tk.Canvas(cam_frame, bg=PANEL_BG, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
 
@@ -564,23 +732,32 @@ class RegisterPage(tk.Frame):
                                     font=(FONT_MONO, 11), fg=FG_DIM, bg=BG, wraplength=360, justify="left")
         self.hint_label.pack(anchor="w")
 
-        self._render_idle_camera()
-
     def on_show(self):
-        pass
+        if not self._visible:
+            self._visible = True
+            self._render_idle_camera()
+
+    def on_hide(self):
+        self._visible = False
 
     def _render_idle_camera(self):
-        if not self._wizard_active:
-            frame = self.app.camera.get_frame()
-            if frame is not None:
-                self._draw_frame(frame)
-            self.after(33, self._render_idle_camera)
+        # Same reasoning as RecognizePage.on_hide: only run the idle preview
+        # loop while this page is actually visible, so it doesn't compete
+        # with other pages' work when you've navigated away.
+        if not self._visible or self._wizard_active:
+            return
+        frame = self.app.camera.get_frame()
+        if frame is not None:
+            self._draw_frame(frame)
+        self.after(33, self._render_idle_camera)
 
     def _draw_frame(self, frame_bgr, boxes=None, overlay_text=None, countdown=None):
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        w = self.canvas.winfo_width() or 640
-        h = self.canvas.winfo_height() or 480
-        rgb = cv2.resize(rgb, (w, h))
+        w = self.canvas.winfo_width()
+        h = self.canvas.winfo_height()
+        if w <= 1 or h <= 1:
+            w, h = 640, 480
+        rgb = fit_frame(rgb, w, h)
         img = ImageTk.PhotoImage(Image.fromarray(rgb))
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor="nw", image=img)
@@ -629,6 +806,7 @@ class RegisterPage(tk.Frame):
                 if not self._countdown(f"Get ready: {step_name}", 3):
                     return
                 collected = 0
+                last_capture_at = 0.0
                 while collected < target:
                     if self._abort:
                         self._finish(aborted=True)
@@ -638,18 +816,26 @@ class RegisterPage(tk.Frame):
                         time.sleep(0.02)
                         continue
 
-                    faces = encode_faces(frame)
-                    boxes = [b for b, _ in faces]
+                    # Detection (on a downscaled frame) is cheap and runs every
+                    # tick so the live box overlay stays smooth. Encoding (the
+                    # 128-d dlib embedding) is the expensive step — it used to
+                    # run on every tick too, which pegged the CPU for the whole
+                    # capture and was the actual cause of the UI feeling
+                    # laggy during registration. Now it only runs once per
+                    # accepted sample, throttled to CAPTURE_INTERVAL.
+                    rgb, boxes = detect_faces(frame)
                     header = f"STEP {step_idx+1}/{len(GUIDED_STEPS)} — {step_name}: {instruction}"
                     self.after(0, self._draw_progress_frame, frame, boxes, header, collected, target)
 
-                    if faces:
-                        # Take the largest detected face if several are in frame.
-                        (top, right, bottom, left), enc = max(
-                            faces, key=lambda f: (f[0][2] - f[0][0]) * (f[0][1] - f[0][3]))
-                        self._captured.append(enc)
-                        collected += 1
-                    time.sleep(0.05)
+                    now = time.time()
+                    if boxes and (now - last_capture_at) >= CAPTURE_INTERVAL:
+                        largest = max(boxes, key=lambda b: (b[2] - b[0]) * (b[1] - b[3]))
+                        encodings = face_recognition.face_encodings(rgb, [largest])
+                        if encodings:
+                            self._captured.append(encodings[0])
+                            collected += 1
+                            last_capture_at = now
+                    time.sleep(0.03)
 
             self.after(0, self._finish, False)
         except Exception as e:
@@ -768,6 +954,102 @@ class ManagePage(tk.Frame):
 
 
 # ============================================================
+# Page: Help
+# ============================================================
+HELP_TEXT = """\
+RECOGNIZE
+  This is the normal running mode. It waits for a scan trigger, then looks
+  at the camera and shows who it sees.
+  - A trigger can come from the ESP32 (pressing the physical button sends
+    "1" over serial), or from the TEST SCAN button — both do exactly the
+    same thing, so TEST SCAN is the easiest way to try this out without
+    any hardware connected.
+  - SERIAL shows LIVE (green) if an ESP32 is connected on the configured
+    port, or TEST MODE (orange) if not — the app works either way. The
+    SERIAL PORT box below it lets you type or pick a different port (↻
+    rescans what's plugged in) and RECONNECT without restarting the app —
+    use this if the ESP32 shows up as e.g. /dev/ttyACM0 instead of the
+    default /dev/ttyUSB0.
+  - QUEUE DEPTH shows how many scans are waiting to be processed. It
+    should almost always read 0; if it keeps climbing, scans are arriving
+    faster than they can be processed (see Troubleshooting below).
+  - MANUAL SEND TO ESP32 skips the camera entirely and writes a 9-digit ID
+    straight to the ESP32's serial port — useful for testing the ESP32's
+    LED/relay wiring and firmware on its own, independent of recognition.
+
+REGISTER
+  Enrolls a new person, or adds more samples to an existing one.
+  1. Enter a 9-digit ID and a display name.
+  2. Click START CAPTURE and follow the 5 on-screen poses (straight, left,
+     right, tilt up, tilt down) — hold each pose steady until the step's
+     progress bar fills.
+  3. CANCEL at any point discards everything captured so far for this
+     session — nothing is saved until all 5 steps finish.
+
+MANAGE
+  Lists everyone currently enrolled: ID, name, how many samples they have,
+  and when they were registered. Select one or more rows and click
+  DELETE SELECTED to remove them. REFRESH re-reads the list (useful right
+  after registering someone from another page).
+
+TROUBLESHOOTING
+  - "Recognize feels slow / laggy": on a CPU without a GPU-accelerated
+    dlib build, each scan does real face-detection + face-encoding work
+    per frame, which takes real time. Reduce SCAN_FRAMES or raise
+    EARLY_EXIT_MARGIN at the top of main.py to trade accuracy for speed.
+  - "Registration feels slow": the guided-capture loop only runs the
+    expensive face-encoding step once per accepted sample (throttled by
+    CAPTURE_INTERVAL), not on every video frame — if it's still slow,
+    that's most likely this machine's CPU being the bottleneck, not a bug.
+  - "Nobody matches" / distances always high: lower FACE_TOLERANCE for
+    stricter matching, or raise it if real matches are being rejected.
+    Also make sure registration and recognition lighting are reasonably
+    similar.
+  - Queue depth keeps growing: the ESP32 (or the TEST SCAN button) is
+    sending triggers faster than scans complete. On the ESP32 side,
+    RETRIGGER_LOCKOUT_MS enforces a minimum gap between triggers — don't
+    lower it below how long a scan actually takes.
+
+ESP32 PROTOCOL
+  ESP32 -> Jetson:  "1\\n"                (trigger: please scan now)
+  Jetson -> ESP32:  "<9-digit-id>\\n"     ("000000000" = unknown/no match)
+  See commu_function/esp32.cpp for the firmware implementing this, with
+  a debounced trigger button, a retrigger lockout, a response timeout,
+  and LED/relay feedback on the result.
+"""
+
+
+class HelpPage(tk.Frame):
+    def __init__(self, parent, app: "App"):
+        super().__init__(parent, bg=BG)
+        self.app = app
+        self._build()
+
+    def _build(self):
+        main = tk.Frame(self, bg=BG)
+        main.pack(fill="both", expand=True, padx=20, pady=20)
+
+        tk.Label(main, text="HOW TO USE THIS APP", font=(FONT_MONO, 16, "bold"),
+                 fg=FG_TEXT, bg=BG).pack(anchor="w", pady=(0, 12))
+
+        text_frame = tk.Frame(main, bg=PANEL_BG, highlightbackground="#333", highlightthickness=2)
+        text_frame.pack(fill="both", expand=True)
+
+        scrollbar = tk.Scrollbar(text_frame)
+        scrollbar.pack(side="right", fill="y")
+
+        text = tk.Text(text_frame, font=(FONT_MONO, 11), fg=FG_TEXT, bg=PANEL_BG,
+                        bd=0, padx=16, pady=16, wrap="word", yscrollcommand=scrollbar.set)
+        text.insert("1.0", HELP_TEXT)
+        text.config(state="disabled")
+        text.pack(fill="both", expand=True)
+        scrollbar.config(command=text.yview)
+
+    def on_show(self):
+        pass
+
+
+# ============================================================
 # App shell
 # ============================================================
 class App:
@@ -790,7 +1072,10 @@ class App:
 
         self.root = tk.Tk()
         self.root.title("Face ID System")
-        self.root.attributes("-fullscreen", True)
+        if START_FULLSCREEN:
+            self.root.attributes("-fullscreen", True)
+        else:
+            self.root.geometry("1200x750")
         self.root.configure(bg=BG)
         self.root.bind("<Escape>", lambda e: self.root.attributes("-fullscreen", False))
         self.root.bind("<F11>", lambda e: self.root.attributes("-fullscreen", True))
@@ -806,6 +1091,7 @@ class App:
             "recognize": RecognizePage(self.container, self),
             "register": RegisterPage(self.container, self),
             "manage": ManagePage(self.container, self),
+            "help": HelpPage(self.container, self),
         }
         for page in self.pages.values():
             page.place(relx=0, rely=0, relwidth=1, relheight=1)
@@ -813,11 +1099,18 @@ class App:
         self.show_page("recognize")
 
     def show_page(self, key: str):
+        current_key = getattr(self, "_current_page_key", None)
+        if current_key is not None and current_key != key:
+            current_page = self.pages[current_key]
+            if hasattr(current_page, "on_hide"):
+                current_page.on_hide()
+
         page = self.pages[key]
         page.tkraise()
         self.nav.set_active(key)
         if hasattr(page, "on_show"):
             page.on_show()
+        self._current_page_key = key
 
     def quit(self):
         log.info("Shutting down")

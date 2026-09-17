@@ -1,0 +1,13 @@
+.git
+.gitignore
+.claude
+env/
+venv/
+.venv/
+.venv*/
+**/__pycache__/
+**/*.pyc
+vector_face_recognition/encodings.pkl
+vector_face_recognition/faces_db.npz
+vector_face_recognition/registry.json
+*.md
